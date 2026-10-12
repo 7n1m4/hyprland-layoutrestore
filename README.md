@@ -35,15 +35,27 @@ hyprctl layoutrestore       # apply saved entries to windows that are open
 hyprctl layoutrestore arm   # also restore windows that open later
 ```
 
-A typical crash-recovery flow:
+A typical crash-recovery flow: `hyprctl layoutrestore arm` early in your session (e.g. from an
+`exec-once` or a keybind). Saved windows that are gone come back on their own, and the matching
+placement below runs as each one opens.
 
-```lua
--- in hyprland.conf
-hl.on("config", function() hl.plugin.load("layoutrestore") end)
-```
+## Restoring windows, not just positions
 
-then bind `hyprctl layoutsave` to something you press before risky work; on the next session,
-`hyprctl layoutrestore arm` right after login puts everything back as it appears.
+`layoutrestore arm` does two things:
+
+1. **Re-execs the saved commands** for windows that no longer exist. Each saved entry stores the
+   `argv` it was captured from, so the same process comes back with the same arguments.
+2. **Places windows as they open.** When a window maps, `window.openLate` matches it to its saved
+   entry and applies workspace, monitor, floating state and (for floating only) geometry.
+
+Relaunched commands are spawned per workspace in **saved insertion order**. That order is what a
+derived layout (scrolling, master-stack, dwindle) turns into geometry — so restoring the order
+restores the tiled positions without forcing geometry onto the tiling algorithm, which would
+immediately override it.
+
+A window is never relaunched when it has no captured command: kernel threads, `/proc` entries whose
+cmdline is unreadable, and **compositor-side processes** (XWayland's server, compositor children) are
+skipped, since spawning those from a restore is not something you want.
 
 ## Configuration
 
@@ -63,18 +75,22 @@ then bind `hyprctl layoutsave` to something you press before risky work; on the 
   their own saved state.
 - Entries older than `staleness_seconds` are ignored at load time.
 
+Geometry is recorded for every window, but only restored for floating ones — a tiled window's
+position is owned by the tiling algorithm, which would immediately override it. For tiled windows
+the insertion order is restored instead, which reproduces the position under a deterministic layout.
+
 ## File format
 
 ```json
-{"version":1,"timestamp":1770000000,"entries":[
+{"version":2,"timestamp":1770000000,"entries":[
   {"class":"kitty","title":"nvim","workspace":"2","monitor":"DP-1",
    "x":100,"y":50,"width":800,"height":600,"floating":true,
-   "workspaceSpecial":false,"timestamp":1770000000}
+   "workspaceSpecial":false,"timestamp":1770000000,"cmdline":"/home/me/.local/bin/kitty --directory=/src","order":0}
 ]}
 ```
 
-Geometry is recorded for every window, but only restored for floating ones — a tiled window's
-position is owned by the tiling algorithm, which would immediately override it.
+No two fields are required, and older files still load: an entry with no `cmdline` can only be
+matched, not relaunched, and an entry with no `order` is placed after every known-order entry.
 
 ## Building
 

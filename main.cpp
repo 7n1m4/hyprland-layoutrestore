@@ -2,6 +2,8 @@
 #include <ctime>
 
 #include <chrono>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 #include <expected>
@@ -24,6 +26,7 @@
 #include <hyprland/src/helpers/time/Time.hpp>
 
 #include <hyprutils/string/String.hpp>
+#include <hyprutils/os/Process.hpp>
 
 #include "globals.hpp"
 
@@ -78,6 +81,30 @@ static int64_t stalenessSeconds() {
 
     const Config::INTEGER SECONDS = g_cfgStaleness->value();
     return SECONDS <= 0 ? 0 : sc<int64_t>(SECONDS);
+}
+
+// Reads /proc/<pid>/cmdline. Returns an empty string when it can't be captured
+// (process reaped, permission denied, kernel thread, or a command with no argv[0]).
+static std::string readProcCmdline(pid_t pid) {
+    if (pid <= 0)
+        return "";
+
+    std::ifstream stream(std::format("/proc/{}/cmdline", pid), std::ios::binary);
+    if (!stream)
+        return "";
+
+    std::string raw((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+    if (raw.empty())
+        return "";
+
+    return LayoutRestore::joinCmdline(raw);
+}
+
+// A window's own process is not something we bring back: relocating it would
+// fight whatever manages the window's app. Covers XWayland (pid of the X server),
+// the Wayland shm backend helpers and compositor children.
+static bool isCompositorSideProcess(pid_t pid, pid_t selfPid) {
+    return pid <= 0 || pid == selfPid;
 }
 
 static bool autosaveEnabled() {
@@ -138,7 +165,26 @@ static LayoutRestore::SLayoutFile captureCurrentWindows() {
         entry.workspaceSpecial = window->m_workspace && window->m_workspace->type() == Workspace::eWorkspaceType::SPECIAL;
         entry.timestamp        = file.timestamp;
 
+        // Only the client's own process is a relaunch candidate. Capturing a
+        // compositor-side pid would have us spawn a compositor on restore.
+        const pid_t PID = window->backend().pid();
+        if (!isCompositorSideProcess(PID, getpid()))
+            entry.cmdline = readProcCmdline(PID);
+
         file.entries.emplace_back(std::move(entry));
+    }
+
+    // Number each workspace's windows in window order. Derived layouts (scrolling,
+    // dwindle, master-stack) place windows from this, so replaying the order
+    // reproduces the saved geometry without forcing it onto the tiling algorithm.
+    size_t cursor = 0;
+    for (size_t i = 0; i < file.entries.size(); ++i) {
+        if (i > 0 && file.entries[i].workspace == file.entries[i - 1].workspace)
+            ++cursor;
+        else
+            cursor = 0;
+
+        file.entries[i].order = sc<int>(cursor);
     }
 
     return file;
@@ -220,6 +266,43 @@ static void applyEntry(PHLWINDOW window, const LayoutRestore::SEntry& entry) {
 
     // 4. consumed: LayoutModel matching is stateless by design (newest entry wins on
     //    re-match), so there is nothing to mark here.
+}
+
+//
+// relaunch: bring back windows that no longer exist
+//
+// Re-executes the saved command for each entry that has one. The compositor then
+// opens the window and the deferred matcher (window.openLate) applies the saved
+// state to it, so there is exactly one code path that positions windows.
+static size_t relaunchSavedWindows(LayoutRestore::SLayoutFile& file) {
+    // Group by workspace so the commands of one workspace are spawned in saved
+    // order, which is what a derived layout turns back into geometry.
+    std::vector<std::string> workspaces;
+    for (const auto& entry : file.entries) {
+        if (!LayoutRestore::isRelaunchable(entry))
+            continue;
+
+        if (std::ranges::find(workspaces, entry.workspace) == workspaces.end())
+            workspaces.emplace_back(entry.workspace);
+    }
+
+    size_t spawned = 0;
+
+    for (const auto& workspace : workspaces) {
+        for (const auto index : LayoutRestore::relaunchOrder(file, workspace)) {
+            const std::string& CMDLINE = file.entries[index].cmdline;
+            if (CMDLINE.empty())
+                continue;
+
+            // runAsync() detaches, so a restored window is not killed with the
+            // compositor and the compositor does not block waiting for it.
+            Hyprutils::OS::CProcess proc(CMDLINE, {});
+            if (proc.runAsync())
+                ++spawned;
+        }
+    }
+
+    return spawned;
 }
 
 static LayoutRestore::SLayoutFile loadLayoutFile() {
@@ -341,11 +424,25 @@ static std::string handleRestore(const std::string& args) {
         g_deferredLoaded = false;
     }
 
-    auto       FILE    = loadLayoutFile();
-    const auto APPLIED = restoreOpenWindows(FILE);
+    auto FILE    = loadLayoutFile();
+    auto APPLIED = restoreOpenWindows(FILE);
 
-    if (APPLIED == 0 && !ARM)
+    // Bring back the windows that are gone. Only spawned when armed: an immediate
+    // restore would have to race the compositor to place them, whereas arming
+    // lets window.openLate do it deterministically as each one maps.
+    size_t RELAUNCHED = 0;
+    if (ARM) {
+        // relaunchSavedWindows needs the untouched file: entries are matched by
+        // the deferred matcher, not consumed here.
+        LayoutRestore::SLayoutFile RELAUNCH_FILE = loadLayoutFile();
+        RELAUNCHED                               = relaunchSavedWindows(RELAUNCH_FILE);
+    }
+
+    if (APPLIED == 0 && RELAUNCHED == 0 && !ARM)
         return "layoutrestore: no open window matched a saved entry";
+
+    if (ARM)
+        return std::format("ok: {} open window(s) placed, {} relaunched", APPLIED, RELAUNCHED);
 
     return "ok";
 }

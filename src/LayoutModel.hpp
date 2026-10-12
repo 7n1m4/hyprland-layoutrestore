@@ -6,9 +6,15 @@
 #include <expected>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace LayoutRestore {
+
+// Current on-disk schema version. Written by serialize(); deserialize()
+// rewrites anything <= 0 to this so a missing/zero version field is treated
+// as the current shape.
+inline constexpr int SCHEMA_VERSION = 2;
 
 struct SEntry {
   std::string cls = "";
@@ -30,6 +36,12 @@ struct SEntry {
   // (scrolling, dwindle) computes geometry from this, so restoring the
   // order reproduces the saved geometry without forcing it. -1 = unknown.
   int order = -1;
+  // The saved window's pid, 0 when unknown. Lets a window that still exists
+  // claim its own entry by identity instead of by class/title guessing.
+  int64_t pid = 0;
+  // Explicit opt-out: the entry is persisted for its geometry but must not
+  // be restored (its window relaunched) on the next session.
+  bool noRestore = false;
 };
 
 struct SLayoutFile {
@@ -72,5 +84,53 @@ SLayoutFile filterStale(const SLayoutFile &file, int64_t now,
 std::expected<void, std::string> writeFile(const std::string &path,
                                            const SLayoutFile &file);
 std::expected<SLayoutFile, std::string> readFile(const std::string &path);
+
+// Indices of the entries saved for the same process: exact pid match AND the
+// same class. Empty when pid == 0, since 0 means "unknown", not "this window".
+std::vector<size_t> matchEntryIndexByIdentity(const SLayoutFile &file,
+                                              int64_t pid,
+                                              const std::string &cls,
+                                              int64_t now,
+                                              int64_t stalenessSeconds);
+
+// Removes the given indices from `file`. Indices are applied highest-first so
+// each erase leaves the remaining indices valid; duplicates and unsorted input
+// are tolerated.
+void consumeEntries(SLayoutFile &file, const std::vector<size_t> &indices);
+
+// Indices of the entries that are allowed to be restored, in saved order.
+std::vector<size_t> restorableEntries(const SLayoutFile &file);
+
+// Entries bucketed by class, so a class-only query scans a subset instead of
+// the whole vector. Indices refer to `file.entries` and stay ascending.
+struct SClassIndex {
+  std::unordered_map<std::string, std::vector<size_t>> byClass;
+};
+SClassIndex buildClassIndex(const SLayoutFile &file);
+
+// matchEntryIndex() restricted to a class: same result for the same inputs,
+// without scanning unrelated entries.
+//
+// Returns a pointer into `file.entries`, not an index. The class index caches
+// absolute indices, which go stale the moment the caller consumes an entry
+// (consumeEntries/erase shift everything above it), so a returned index would
+// be off by one or out of bounds on the next query. A pointer is resolved
+// against the live vector in the same expression, so it cannot go stale.
+const LayoutRestore::SEntry *
+matchEntryIn(const LayoutRestore::SLayoutFile &file, const std::string &cls,
+             const std::string &title, int64_t now, int64_t stalenessSeconds);
+
+// matchEntryIndex() restricted to the classes in `index`: same result for the
+// same inputs, without scanning unrelated entries. Requires index to have been
+// built from `file`.
+//
+// The class index caches absolute indices into `file.entries`, so this is only
+// safe to call while `file.entries` is not being mutated. Callers that consume
+// entries use matchEntryIn() instead.
+std::optional<size_t>
+matchEntryIndexFrom(const LayoutRestore::SLayoutFile &file,
+                    const SClassIndex &index, const std::string &cls,
+                    const std::string &title, int64_t now,
+                    int64_t stalenessSeconds);
 
 } // namespace LayoutRestore

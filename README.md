@@ -33,11 +33,21 @@ against the Hyprland you run (run `hyprpm update` after upgrading Hyprland).
 hyprctl layoutsave          # write the layout to disk now
 hyprctl layoutrestore       # apply saved entries to windows that are open
 hyprctl layoutrestore arm   # also restore windows that open later
+hyprctl layoutrestore disarm # stop the deferred restore
 ```
 
 A typical crash-recovery flow: `hyprctl layoutrestore arm` early in your session (e.g. from an
 `exec-once` or a keybind). Saved windows that are gone come back on their own, and the matching
 placement below runs as each one opens.
+
+Arming is **bounded**, so it never lingers as a session-wide window-mover:
+
+- it expires 30 seconds after arming,
+- it disarms itself once every relaunched process has matched and no saved entry is left to place,
+- `hyprctl layoutrestore disarm` drops it immediately.
+
+Re-arming while already armed reloads the file but does **not** spawn a second wave of relaunched
+windows.
 
 ## Restoring windows, not just positions
 
@@ -65,10 +75,19 @@ skipped, since spawning those from a restore is not something you want.
 | `plugin:layoutrestore:autosave` | bool | `true` | Autosave on layout changes |
 | `plugin:layoutrestore:autosave_interval` | int | `5000` | Minimum ms between autosaves |
 | `plugin:layoutrestore:staleness_seconds` | int | `0` | Drop entries older than this (`0` = never expire) |
+| `plugin:layoutrestore:save_on_exit` | bool | `true` | Save once more when the compositor exits |
+| `plugin:layoutrestore:no_restore` | bool | `false` | Save windows as `norestore` so they are never placed back |
+
+Autosave is suspended while a restore is in flight: the deferred matcher works from a snapshot of the
+file, so rewriting it mid-restore would change what the next restore — and the compositor's next
+startup — reads.
 
 ## Matching rules
 
 - A window's class (app-id) must match a saved entry's class. Windows without a class never match.
+- An already-open process claims its saved entries **by pid** first, so a window that merely opened
+  earlier cannot take a slot meant for a relaunched sibling. Entries without a saved pid fall back to
+  class/title matching.
 - An empty saved title is a wildcard. A non-empty saved title must match the window's title exactly.
 - Among the candidates, the newest entry wins; on equal timestamps the later one in the file wins.
 - Each saved entry is consumed by at most one window, so two windows of the same class each get
@@ -85,12 +104,18 @@ the insertion order is restored instead, which reproduces the position under a d
 {"version":2,"timestamp":1770000000,"entries":[
   {"class":"kitty","title":"nvim","workspace":"2","monitor":"DP-1",
    "x":100,"y":50,"width":800,"height":600,"floating":true,
-   "workspaceSpecial":false,"timestamp":1770000000,"cmdline":"/home/me/.local/bin/kitty --directory=/src","order":0}
+   "workspaceSpecial":false,"timestamp":1770000000,"cmdline":"/home/me/.local/bin/kitty --directory=/src","order":0,
+   "pid":12345,"norestore":false}
 ]}
 ```
 
 No two fields are required, and older files still load: an entry with no `cmdline` can only be
-matched, not relaunched, and an entry with no `order` is placed after every known-order entry.
+matched, not relaunched; with no `pid` it is matched by class/title only; with no `norestore` it is
+restored as normal; and an entry with no `order` is placed after every known-order entry.
+
+The two new fields are additive, so both directions stay compatible: an old file reads as
+`pid:0`/`norestore:false`, and an old build reading a new file ignores the keys it doesn't know.
+`version` is preserved as written; a missing or non-positive one is read as the current version.
 
 ## Building
 

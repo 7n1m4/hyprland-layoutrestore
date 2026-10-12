@@ -15,12 +15,13 @@ template <> struct glz::meta<LayoutRestore::SEntry> {
       &LayoutRestore::SEntry::floating,
       &LayoutRestore::SEntry::workspaceSpecial,
       &LayoutRestore::SEntry::timestamp, &LayoutRestore::SEntry::cmdline,
-      &LayoutRestore::SEntry::order);
+      &LayoutRestore::SEntry::order, &LayoutRestore::SEntry::pid,
+      &LayoutRestore::SEntry::noRestore);
 
-  static constexpr auto keys = std::array<std::string_view, 13>{
+  static constexpr auto keys = std::array<std::string_view, 15>{
       "class",     "title",   "workspace", "monitor",  "x",
       "y",         "width",   "height",    "floating", "workspaceSpecial",
-      "timestamp", "cmdline", "order"};
+      "timestamp", "cmdline", "order",     "pid",      "norestore"};
 };
 
 std::optional<std::string> LayoutRestore::serialize(const SLayoutFile &file) {
@@ -37,7 +38,13 @@ LayoutRestore::deserialize(const std::string &json) {
   if (!result)
     return std::unexpected(glz::format_error(result.error()));
 
-  return *result;
+  auto file = *result;
+  // A missing or pre-versioned file reads as 0: normalize it to the current
+  // schema so every downstream version comparison sees a real version.
+  if (file.version <= 0)
+    file.version = SCHEMA_VERSION;
+
+  return file;
 }
 
 std::vector<std::string> LayoutRestore::splitCmdline(const std::string &cmd) {
@@ -213,4 +220,127 @@ LayoutRestore::readFile(const std::string &path) {
   std::string json((std::istreambuf_iterator<char>(stream)),
                    std::istreambuf_iterator<char>());
   return deserialize(json);
+}
+
+std::vector<size_t> LayoutRestore::matchEntryIndexByIdentity(
+    const SLayoutFile &file, const int64_t pid, const std::string &cls,
+    const int64_t now, const int64_t stalenessSeconds) {
+  if (pid == 0)
+    return {};
+
+  std::vector<size_t> out;
+  for (size_t i = 0; i < file.entries.size(); ++i) {
+    const auto &entry = file.entries[i];
+
+    if (entry.pid != pid)
+      continue;
+
+    if (entry.cls != cls)
+      continue;
+
+    if (stalenessSeconds > 0 && now - entry.timestamp > stalenessSeconds)
+      continue;
+
+    out.push_back(i);
+  }
+
+  return out;
+}
+
+void LayoutRestore::consumeEntries(SLayoutFile &file,
+                                   const std::vector<size_t> &indices) {
+  if (indices.empty())
+    return;
+
+  // Highest first: each erase shifts only indices above it, and those have
+  // already been removed, so the remaining targets stay valid.
+  std::vector<size_t> sorted = indices;
+  std::sort(sorted.begin(), sorted.end());
+  sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+
+  for (size_t i = sorted.size(); i-- > 0;) {
+    if (sorted[i] >= file.entries.size())
+      continue;
+
+    file.entries.erase(file.entries.begin() +
+                       static_cast<std::ptrdiff_t>(sorted[i]));
+  }
+}
+
+std::vector<size_t> LayoutRestore::restorableEntries(const SLayoutFile &file) {
+  std::vector<size_t> out;
+  for (size_t i = 0; i < file.entries.size(); ++i) {
+    if (!file.entries[i].noRestore)
+      out.push_back(i);
+  }
+
+  return out;
+}
+
+LayoutRestore::SClassIndex
+LayoutRestore::buildClassIndex(const SLayoutFile &file) {
+  SClassIndex index;
+  for (size_t i = 0; i < file.entries.size(); ++i)
+    index.byClass[file.entries[i].cls].push_back(i);
+
+  return index;
+}
+
+const LayoutRestore::SEntry *
+LayoutRestore::matchEntryIn(const SLayoutFile &file, const std::string &cls,
+                            const std::string &title, const int64_t now,
+                            const int64_t stalenessSeconds) {
+  if (cls.empty())
+    return nullptr;
+
+  const LayoutRestore::SEntry *best = nullptr;
+
+  for (const auto &entry : file.entries) {
+    if (entry.cls != cls)
+      continue;
+
+    if (!entry.title.empty() && entry.title != title)
+      continue;
+
+    if (stalenessSeconds > 0 && now - entry.timestamp > stalenessSeconds)
+      continue;
+
+    if (best && entry.timestamp < best->timestamp)
+      continue;
+
+    best = &entry;
+  }
+
+  return best;
+}
+
+std::optional<size_t> LayoutRestore::matchEntryIndexFrom(
+    const SLayoutFile &file, const SClassIndex &index, const std::string &cls,
+    const std::string &title, const int64_t now,
+    const int64_t stalenessSeconds) {
+  if (cls.empty())
+    return std::nullopt;
+
+  const auto it = index.byClass.find(cls);
+  if (it == index.byClass.end())
+    return std::nullopt;
+
+  std::optional<size_t> best;
+
+  for (const size_t i : it->second) {
+    const auto &entry = file.entries[i];
+
+    if (!entry.title.empty() && entry.title != title)
+      continue;
+
+    if (stalenessSeconds > 0 && now - entry.timestamp > stalenessSeconds)
+      continue;
+
+    if (best && entry.timestamp < file.entries[*best].timestamp)
+      continue;
+
+    best = i;
+  }
+
+  return best;
 }

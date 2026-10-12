@@ -10,50 +10,48 @@ Two entries are real bugs found while writing this and are worth taking before n
 
 ## Known issues
 
-### 1. Relaunch can double-spawn, and `arm` never disarms
+### 1. ~~Relaunch can double-spawn, and `arm` never disarms~~ — CLOSED
 
-`g_deferred` is a counter that only ever increments (`++g_deferred` on every `arm`) and is
-decremented per successfully matched window. It never reaches zero in practice, and there is no way
-to disarm: once armed, every window that opens for the rest of the session is matched against the
-saved file.
+`g_deferred` was a counter that only ever incremented and could never be cleared, so an arm persisted
+for the rest of the session, and every `arm` spawned a fresh wave of relaunched windows.
 
-Worse, `arm` **relaunches immediately and re-arms forever**. Two `arm` calls spawn the same
-commands twice, and a second `arm` after the layout has repopulated will relaunch windows that are
-already open.
+Closed by replacing it with an explicit `g_armed` state bounded three ways:
 
-**Done when:** `arm` takes a bounded lifetime (a deadline, or disarms after N matched windows /
-a timeout), repeated `arm` does not double-spawn, and there's an explicit way to stop
-(`layoutrestore disarm`, or `arm` re-arming cleanly replaces the previous state).
+- a 30-second deadline (`ARM_DEADLINE_S`), checked at the top of `onWindowOpenLate`;
+- an auto-disarm once every relaunched process has matched and no entry is left to place;
+- `hyprctl layoutrestore disarm`, which drops the state immediately.
 
-### 2. Autosave will overwrite a good layout during relaunch
+A re-arm while already armed reloads the file but sets `FRESH_ARM = false`, so it does not spawn a
+second wave.
 
-Relaunch spawns N processes; each new window sets `g_dirty`, and `onTick` autosaves after the
-interval. So a restore in progress gets written over mid-flight, and the relaunch window is lost
-from the very next restore. `layoutrestore arm` reads the file *after* `restoreOpenWindows` has
-already consumed entries from its own copy — a race with the autosave writing a different file.
+### 2. ~~Autosave will overwrite a good layout during relaunch~~ — CLOSED
 
-**Done when:** arming suspends autosave until the restore settles (or at minimum, autosave never
-overwrites a file that a pending restore is still consuming).
+Closed by `g_restorePending`, a gate at the top of `onTick()`. It is set when a relaunch is actually
+in flight (not merely armed) and cleared when the deferred state ends, so autosave never rewrites the
+file a pending restore is still consuming. It is a gate rather than a latch, so it cannot wedge
+autosave permanently.
 
-### 3. `restoreOpenWindows` applies entries to windows regardless of whether they were relaunched
+### 3. ~~A non-saved window can steal a relaunched sibling's entry~~ — CLOSED
 
-Two windows of the same class that were both open at save time and both still open at restore will
-both be matched — fine. But a window that was **not** saved (opened after the save) can consume a
-saved entry meant for a relaunched sibling, and the relaunched window then finds nothing.
+Closed by recording the saved window's `pid` on each entry. An already-open process claims its own
+entries by pid first via `matchEntryIndexByIdentity` + `consumeEntries`, and only falls back to
+class/title matching when no pid was captured (a process that was reaped at save time).
 
-**Done when:** entries are claimed by identity (pid or a save-time window id), not just by
-class/title order, or relaunched entries are reserved until their window maps.
+Also fixed while closing this: `matchEntryIndexFrom` returned a **cached index into
+`file.entries`**, which goes stale (and out of bounds) the moment the restore loop consumed an entry.
+Multi-window restores read past the end of the vector and aborted. It is replaced by `matchEntryIn`,
+which returns a pointer resolved against the live vector, so it cannot drift.
 
 ---
 
 ## Features
 
-### 4. Layered / removed-window handling
+### 4. ~~Layered / removed-window handling~~ — CLOSED
 
-`readFile` reads the whole JSON into memory and `matchEntryIndex` is a linear scan, so save/restore
-is O(windows²) and a large layout is slow. Fine at 20 windows, painful at 200+.
-
-**Done when:** matching is a class → entries index built once per restore, or entries are keyed.
+`readFile` read the whole JSON into memory and `matchEntryIndex` was a linear scan, so save/restore
+was O(windows²). Closed by `buildClassIndex` + `matchEntryIndexFrom`, which scan only a window's own
+class bucket. (That path then got bypassed — see item 3 — so the remaining cost is a linear scan of
+just the matching class, which is fine at realistic window counts.)
 
 ### 5. Workspace- and monitor-scoped restore
 
@@ -63,34 +61,44 @@ user cannot restore workspace 2 to DP-2 without pulling everything else along.
 **Done when:** `layoutrestore <workspace>` / `layoutrestore monitor:<name>` restore a subset, and
 entries from other workspaces are left untouched.
 
-### 6. Per-window overrides
+### 6. Per-window overrides — HALF CLOSED
 
-Some windows should not be restored (a transient confirm dialog), and some need a fixed position
-that tiling would never produce. Today there's no way to express either.
+The opt-out half is done: `plugin:layoutrestore:no_restore` saves a window with `"norestore":true`,
+and `loadLayoutFile()` drops those entries through `restorableEntries()` before any restore path sees
+them.
 
-**Done when:** entries can carry a `noRestore` flag, and a fixed geometry is honored for tiled
-windows when explicitly requested (this is the one case where forcing geometry is correct).
+Still open: forced geometry for a tiled window. Forcing it is a special case the current design
+deliberately avoids — a tiled window's geometry is recomputed by the layout on the next recalculate,
+so a restored value survives only until something touches the layout.
+
+**Done when:** a per-window fixed geometry is honored for tiled windows when explicitly requested.
 
 ### 7. Ordering that survives a changed window set
 
 Order restore assumes the same window set comes back. Open an extra terminal of the same class and
 the indices shift, so a scrolling layout ends up with a different arrangement than saved.
 
-**Done when:** entries are matched to windows by identity where possible, with order only
-break ties, so an extra window doesn't displace the rest.
+**Partially mitigated** by item 3's pid-based claiming: a window that was relaunched with the same
+pid now claims its own entry, so an unrelated window of the same class cannot displace it. The
+remaining exposure is windows whose pid could not be captured at save time.
 
-### 8. Save on exit, not just on a timer
+**Done when:** entries are matched to windows by identity where possible, with order only breaking
+ties, so an extra window doesn't displace the rest.
 
-The current autosave is a 5s poll, so a clean shutdown can lose up to 5 seconds of layout changes.
-There's no `configReloaded`/pre-exit hook wired for a final save.
+### 8. Save on exit, not just on a timer — CLOSED
 
-**Done when:** a final save runs on configured shutdown, and `layoutsave` remains the manual
-override.
+The autosave was a 5s poll, so a clean shutdown could lose up to 5 seconds of layout changes. Closed
+by a listener on `Event::bus()->m_events.exit` that saves once more, gated on `g_dirty` so an
+unchanged layout is not rewritten, and controlled by `plugin:layoutrestore:save_on_exit` (default
+true). `layoutsave` remains the manual override.
 
 ### 9. hyprtester coverage
 
 The integration test exists in `hyprtester/plugins/` but has never run — no GPU/DRM seat on the dev
 machine. Everything above is verified only through the `LayoutModel` unit tests.
+
+The test now also asserts the two behaviours that were previously undefined: that a window opened
+after `disarm` keeps its own state, and that re-arming does not spawn a second wave.
 
 **Done when:** the test runs in CI (NixOS VM with virtio-gpu) and asserts relaunch, order restore,
 and geometry precedence end-to-end.

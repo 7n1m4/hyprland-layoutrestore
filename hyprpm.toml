@@ -1,0 +1,4 @@
+[layoutrestore]
+description = "Save and restore window layout (geometry, workspace, monitor, floating state) by app-id/class"
+output = "layoutrestore.so"
+build = ["make all"]

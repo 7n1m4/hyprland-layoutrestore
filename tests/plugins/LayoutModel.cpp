@@ -685,3 +685,57 @@ TEST_F(CLayoutModelFileIOTest, entriesWithoutNewFieldsStillDeserialize) {
     EXPECT_TRUE(read->entries[0].cmdline.empty());
     EXPECT_EQ(read->entries[0].order, -1);
 }
+
+TEST(LayoutRelaunch, splitCmdlineRecoversOriginalArgv) {
+    static const char BYTES[] = {'k', 'i', 't', 't', 'y', '\0', '-', '-', 'd', 'i', 'r', 'e', 'c', 't', 'o', 'r', 'y', '\0', '/', 't', 'm', 'p', '\0'};
+    const std::string       raw(BYTES, sizeof(BYTES));
+
+    const std::string       cmd      = LayoutRestore::joinCmdline(raw);
+    ASSERT_EQ(cmd, "kitty --directory /tmp");
+
+    const auto              argv     = LayoutRestore::splitCmdline(cmd);
+    const std::vector<std::string> argvClean(argv.begin(), argv.end());
+    ASSERT_EQ(argvClean.size(), 3U);
+    EXPECT_EQ(argvClean[0], "kitty");
+    EXPECT_EQ(argvClean[1], "--directory");
+    EXPECT_EQ(argvClean[2], "/tmp");
+}
+
+TEST(LayoutRelaunch, splitCmdlineOfSingleWordHasNoArgs) {
+    const auto argv = LayoutRestore::splitCmdline("firefox");
+    ASSERT_EQ(argv.size(), 1U);
+    EXPECT_EQ(argv.front(), "firefox");
+    EXPECT_TRUE(argv.size() == 1U);
+}
+
+TEST(LayoutRelaunch, splitCmdlineKeepsEmptyTokensSoCallerFiltersThem) {
+    // A double space yields an empty token. The caller drops empties, but the
+    // splitter must not do it itself: silently collapsing would shift arguments.
+    const auto argv = LayoutRestore::splitCmdline("prog  arg");
+    ASSERT_EQ(argv.size(), 3U);
+    EXPECT_EQ(argv[0], "prog");
+    EXPECT_TRUE(argv[1].empty());
+    EXPECT_EQ(argv[2], "arg");
+}
+
+TEST(LayoutRelaunch, splitThenJoinRoundTripsEmptyArgv) {
+    // What was written must come back: the empty argv element survives the split,
+    // so a relaunch keeps the same argv positions as the original process.
+    static const char BYTES[] = {'p', 'r', 'o', 'g', '\0', '\0', 'a', 'r', 'g', '\0'};
+    const std::string raw(BYTES, sizeof(BYTES));
+
+    const std::string cmd  = LayoutRestore::joinCmdline(raw);
+    EXPECT_EQ(cmd, "prog  arg");
+
+    const auto        argv = LayoutRestore::splitCmdline(cmd);
+    ASSERT_EQ(argv.size(), 3U);
+    EXPECT_EQ(LayoutRestore::joinCmdline(cmd), "prog  arg");
+}
+
+TEST(LayoutRelaunch, splitCmdlineOfEmptyStringYieldsOneEmptyToken) {
+    // An empty command is not relaunchable; the caller's empty-check rejects it
+    // before this matters. This pins that we don't fabricate an argv[0].
+    const auto argv = LayoutRestore::splitCmdline("");
+    ASSERT_EQ(argv.size(), 1U);
+    EXPECT_TRUE(argv.front().empty());
+}
